@@ -4,6 +4,8 @@
 
 **Status:** v5-ws (2026-08-13, ~5.5 hours development). Production-ready for demo/internal use.
 
+> **Note:** Repository renamed from `openclaw-acp` to `OpenClaw-mcode-ACP` on 2026-08-13. All commits, stars, and links are preserved (301 redirect from old URL).
+
 ---
 
 ## What's in the box
