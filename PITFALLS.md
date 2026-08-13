@@ -21,6 +21,32 @@ AUTH_TOKEN = ***'os').environ, 'get')('ACP_TOKEN', 'openclaw-acp-demo-token')
 
 **Auto-fix scripts:** `tests/fix-server-auth.py` (v1) and `tests/fix-server-auth-v2.py` (handles `***` prefix correctly).
 
+## ⭐⭐⭐ 11. Mavis `--permission smart` deadlock via ACP
+
+**Problem:** When ACP dispatches a Mavis task (subprocess via `cmd.exe /c mcode.cmd`), Mavis's stdin is not a TTY (it's `None` because `subprocess.Popen` didn't pass `stdin=PIPE`). Mavis's default `--permission smart` policy tries to prompt user for confirmation on any tool call (read/write/bash) → sees no TTY → returns `PERMISSION_REQUIRED` → every task deadlocks immediately.
+
+**Symptom:** Every task completes in ~5-30s with `status: blocked` and `error.code: PERMISSION_REQUIRED`. Mavis answers "我先...扫一下/看一下" then dies.
+
+**Fix:** Pass `--permission full` to Mavis (in `acp-server.py` line 217):
+- `ask` / `smart` — interactive confirm (blocked without TTY)
+- `full` — auto-approve all (✅ use this for ACP dispatch)
+- `off` — also works but disables *all* safety; `full` is the better choice
+
+**Code change:**
+```python
+mcode_args = [
+    'exec', task['prompt'],
+    '--cwd', task['workspace'],
+    '--output-format', 'json',
+    '--permission', 'full',  # was 'smart' — blocks ACP dispatch
+    '--timeout', task['timeout'],
+]
+```
+
+**Alternative (NOT recommended):** Pre-feed files via `--files` so Mavis never needs the read tool. This works but is a workaround — Mavis can't autonomously explore your workspace.
+
+**Gotcha discovered during this fix:** When OpenClaw spawns ACP subprocess, **also** the `LOG_FILE` and `DEFAULT_DB_PATH` env vars need `os.path.expandvars()` — the strings literally contain `%USERPROFILE%` which Python doesn't auto-expand in `os.environ.get()` defaults.
+
 ## 2. Windows Terminal defaultProfile GUID mismatch
 
 **Problem:** Installing PowerShell 7.6 registers a new Windows Terminal profile (with a new GUID), but `settings.json`'s `defaultProfile` still points to the old PowerShell 5.1 GUID. Windows Terminal shows "加载用户设置时遇到错误" on every launch.

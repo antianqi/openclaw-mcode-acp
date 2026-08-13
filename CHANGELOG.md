@@ -9,6 +9,23 @@
 - Implementation: `from websockets.asyncio.server import serve` (new asyncio API)
 - WS counter for active_connections in health endpoint
 
+## v6-full — 2026-08-13 (hotfix)
+
+**Bug fix:** ACP-dispatched Mavis tasks blocked by `PERMISSION_REQUIRED` (Mavis needs TTY for interactive confirmation; ACP subprocess has no TTY → all tasks deadlocked).
+
+**Fix:** Change `--permission smart` → `--permission full` in mcode args (line 217 of `acp-server.py`).
+- `smart` = "ask user for confirmation via stdin" (impossible without TTY)
+- `full` = "auto-approve all tool calls" (safe for ACP: boss owns the dispatcher)
+- `off` = also works but disables *all* safety; `full` is the right middle-ground
+
+**Also fixed:**
+- `LOG_FILE` and `DEFAULT_DB_PATH` now use `os.path.expandvars()` — Windows env vars like `%USERPROFILE%` were not being expanded before, causing FileNotFoundError on fresh starts.
+
+**Verification:**
+- Before fix: 5/5 tasks blocked by `PERMISSION_REQUIRED` (any tool use deadlocked)
+- After fix: 3/3 tasks succeeded (bash + read + write + multi-tool flow all working autonomously)
+- Tested via `task_56965df108124346` and `task_8eec2f2251764c3a`
+
 ## v4-queue — 2026-08-13
 
 **Feature:** Worker pool + FIFO queue + `queued` status

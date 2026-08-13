@@ -10,11 +10,23 @@ Usage:
 For full docs see SKILL.md in this directory.
 """
 import sys
+import os
 from pathlib import Path
 from typing import Optional, Callable, Iterator, Dict, Any, List
 
-# Make acp_client importable from sibling skill dir (use absolute path for robustness)
-sys.path.insert(0, r'%USERPROFILE%\.openclaw\skills\mavis-coding')
+# Make acp_client importable. Try multiple locations:
+#   1. Same project sibling: D:\openclaw-acp\client\
+#   2. Original OpenClaw install: %USERPROFILE%\.openclaw\skills\mavis-coding\
+_HERE = Path(__file__).parent.resolve()
+_CANDIDATES = [
+    str(_HERE.parent / 'client'),                              # packaged project
+    r'%USERPROFILE%\.openclaw\skills\mavis-coding',            # original install
+]
+for _p in _CANDIDATES:
+    _expanded = os.path.expandvars(_p)
+    if os.path.isdir(_expanded) and os.path.exists(os.path.join(_expanded, 'acp_client.py')):
+        sys.path.insert(0, _expanded)
+        break
 
 from acp_client import ACPClient, ACPError, read_token_from_server
 

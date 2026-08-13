@@ -30,10 +30,10 @@ import time
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
-DEFAULT_DB_PATH = os.environ.get(
+DEFAULT_DB_PATH = os.path.expandvars(os.environ.get(
     'ACP_DB_PATH',
     r'%USERPROFILE%\AppData\Local\Temp\acp-tasks.db'
-)
+))
 
 # Fields allowed to be updated via store.update()
 ALLOWED_UPDATE_FIELDS = frozenset({
