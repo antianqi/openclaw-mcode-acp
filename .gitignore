@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / runtime
+*.log
+*.pid
+*.db
+*.sqlite
+*.sqlite3
+
+# Local config (use env vars)
+.env
+.env.local
+config.local.yaml
+
+# Backups (keep backups/ dir but ignore .bak files in normal commits)
+*.bak
+!backups/.gitkeep
