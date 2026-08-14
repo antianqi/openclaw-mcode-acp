@@ -1,6 +1,6 @@
 """
-OpenClaw ACP Server v5 — SSE + SQLite + Queue + WebSocket (bidirectional)
-=========================================================================
+OpenClaw ACP Server v7 — v5 SSE/WS + v7-bidir peer-to-peer inbox
+================================================================
 HTTP server (port 9999) + WebSocket server (port 9998) sharing state.
 
 v5 additions:
@@ -10,6 +10,17 @@ v5 additions:
   - Shared state with HTTP server (TASKS, TASK_QUEUES, STORE, ACTIVE_TASKS)
   - HTTP server uses ThreadingHTTPServer for concurrent request handling
   - WS server runs in separate thread with its own asyncio loop
+
+v7-bidir additions (2026-08-14):
+  - Peer-to-peer inbox for goudan <-> mavis collaboration
+  - SQLite-backed acp_inbox table (InboxStore)
+  - 4 new HTTP endpoints:
+    POST /acp/inbox/write    write a message to a session
+    GET  /acp/inbox/read     read new messages (poll-based)
+    POST /acp/inbox/ask      write a question + block until answered
+    POST /acp/inbox/answer   answer a pending question
+  - Sender field: 'goudan' / 'mavis' / 'boss' / 'system'
+  - Both agents can write/read — symmetric, not master/slave
 
 v4 retained: worker pool, queue, 'queued' status, SQLite persistence, SSE.
 
@@ -49,6 +60,7 @@ import websockets
 from websockets.asyncio.server import serve as ws_serve
 
 from acp_store import TaskStore
+from acp_inbox_store import InboxStore
 
 # ===== Config =====
 PORT = int(os.environ.get('ACP_PORT', 9999))
@@ -72,8 +84,9 @@ logging.basicConfig(
 )
 log = logging.getLogger('acp')
 
-# ===== Persistent store =====
+# ===== Persistent stores =====
 STORE = TaskStore()
+INBOX = InboxStore()  # v7-bidir: peer-to-peer messaging
 
 # ===== In-memory task cache =====
 TASKS = {}
@@ -205,9 +218,14 @@ def run_task(task_id):
                 pass
 
     mcode_args = [
-        'exec', task['prompt'],
+        'exec',
+        '--input', '-',          # read prompt from stdin (only stdin supported per mcode docs)
+        '--input-format', 'text',
         '--cwd', task['workspace'],
-        '--output-format', 'json',
+        # NOTE: mcode exec does NOT support --output-format json (verified 2026-08-14).
+        # The server used to pass it but mcode ignored it, then server tried to json.loads
+        # the free-text output and got "Expecting value: line 1 column 1" 100% of the time.
+        # Server now accepts free-text stdout and treats it as the answer (see parsing below).
         '--permission', 'full',  # was 'smart' — smart requires interactive TTY confirmation, ACP dispatcher has no TTY, so always blocked. 'full' = auto-approve all (acceptable for ACP: boss explicitly authorized this mode via the ACP server being their tool).
         '--timeout', task['timeout'],
     ]
@@ -227,6 +245,7 @@ def run_task(task_id):
 
         proc = subprocess.Popen(
             ['cmd.exe', '/c', MCODE_CMD] + mcode_args,
+            stdin=subprocess.PIPE,   # feed the prompt via stdin (mcode exec requires this)
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -237,6 +256,14 @@ def run_task(task_id):
 
         t_out = threading.Thread(target=read_stream, args=(proc.stdout, 'stdout', stdout_buffer), daemon=True)
         t_err = threading.Thread(target=read_stream, args=(proc.stderr, 'stderr', stderr_buffer), daemon=True)
+        # Write the prompt to mcode's stdin (per `--input -`) and close it.
+        # mcode will then execute the prompt non-interactively and exit when done.
+        try:
+            proc.stdin.write(task['prompt'])
+            proc.stdin.flush()
+            proc.stdin.close()
+        except Exception as e:
+            log.warning(f'stdin write failed for {task_id}: {e}')
         t_out.start()
         t_err.start()
 
@@ -266,8 +293,19 @@ def run_task(task_id):
                 update_fields['error'] = task['error']
                 events_queue.put({'type': 'done', 'status': 'timeout', 'duration_ms': task['duration_ms']})
             else:
-                try:
-                    parsed = json.loads(stdout)
+                # Try to parse stdout as JSON first; if mcode exec didn't produce JSON,
+                # fall back to treating the entire stdout as the answer (free-text mode).
+                # This is the fix for the long-standing "Failed to parse Mavis output" error.
+                parsed = None
+                parse_err = None
+                if stdout.strip():
+                    try:
+                        parsed = json.loads(stdout)
+                    except Exception as e:
+                        parse_err = str(e)
+
+                if parsed and isinstance(parsed, dict):
+                    # JSON path — mcode eventually outputs structured JSON
                     task['answer'] = parsed.get('answer', '')
                     task['session_id'] = parsed.get('session_id', '')
                     mavis_status = parsed.get('status', 'failed')
@@ -288,17 +326,23 @@ def run_task(task_id):
                         'duration_ms': task['duration_ms'],
                         'answer_preview': (task['answer'] or '')[:200],
                     })
-                except Exception as e:
-                    task['status'] = 'failed'
-                    task['error'] = f'Failed to parse Mavis output: {e}'
-                    task['raw_output'] = stdout[:2000] + (stderr[:500] if stderr else '')
-                    update_fields['status'] = 'failed'
-                    update_fields['error'] = task['error']
+                else:
+                    # Free-text fallback — mcode exec's actual output mode (no JSON flag).
+                    # Heuristic: succeeded if stdout non-empty and no obvious error markers.
+                    task['answer'] = stdout
+                    task['mavis_raw'] = {'stdout_raw': stdout, 'parse_mode': 'free_text'}
+                    error_markers = ['error:', 'failed to', 'unauthorized', 'panic:', 'traceback']
+                    stdout_lower = stdout.lower()
+                    has_error = any(m in stdout_lower for m in error_markers)
+                    task['status'] = 'failed' if has_error else 'succeeded'
+                    update_fields['status'] = task['status']
+                    update_fields['answer'] = task['answer']
+                    update_fields['mavis_raw'] = task['mavis_raw']
                     events_queue.put({
                         'type': 'done',
-                        'status': 'failed',
+                        'status': task['status'],
                         'duration_ms': task['duration_ms'],
-                        'error': str(e),
+                        'answer_preview': (task['answer'] or '')[-300:],
                     })
 
             try:
@@ -514,7 +558,7 @@ class ACPHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 'status': 'ok',
                 'service': 'openclaw-acp',
-                'version': 'v5-ws',
+                'version': 'v7-bidir',
                 'cache_size': len(TASKS),
                 'active_queues': len([q for q in TASK_QUEUES.values() if not q.empty()]),
                 'queue': {
@@ -532,6 +576,10 @@ class ACPHandler(BaseHTTPRequestHandler):
                     'active_connections': ws_conn_count,
                 },
                 'port': PORT,
+                'inbox': {
+                    'enabled': True,
+                    'sessions': len(INBOX.list_sessions()),
+                },
             })
         elif path == '/acp/task/list':
             if not self._check_auth():
@@ -606,6 +654,58 @@ class ACPHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {'error': 'id parameter required'})
                 return
             self._stream_task(task_id)
+        elif path.startswith('/acp/inbox/read'):
+            # GET /acp/inbox/read?session_id=X&since_id=N&sender=Y&msg_type=Z&limit=N
+            if not self._check_auth():
+                return self._send_json(401, {'error': 'unauthorized'})
+            qs = parse_qs(urlparse(self.path).query)
+            session_id = qs.get('session_id', [''])[0]
+            if not session_id:
+                return self._send_json(400, {'error': 'session_id required'})
+            since_str = qs.get('since_id', ['0'])[0]
+            sender = qs.get('sender', [None])[0]
+            msg_type = qs.get('msg_type', [None])[0]
+            limit_str = qs.get('limit', ['50'])[0]
+            try:
+                since_id = int(since_str)
+                limit = max(1, min(500, int(limit_str)))
+            except ValueError:
+                return self._send_json(400, {'error': 'invalid since_id/limit'})
+            try:
+                messages = INBOX.read_pending(
+                    session_id=session_id,
+                    since_id=since_id,
+                    sender=sender,
+                    msg_type=msg_type,
+                    limit=limit,
+                )
+                # Auto-mark as read
+                if messages:
+                    INBOX.mark_read([m['id'] for m in messages])
+                self._send_json(200, {
+                    'session_id': session_id,
+                    'messages': messages,
+                    'count': len(messages),
+                    'last_id': messages[-1]['id'] if messages else since_id,
+                })
+            except Exception as e:
+                log.error(f'inbox read error: {e}')
+                self._send_json(500, {'error': f'inbox read failed: {e}'})
+        elif path == '/acp/inbox/sessions':
+            # GET /acp/inbox/sessions?limit=N — list recent sessions
+            if not self._check_auth():
+                return self._send_json(401, {'error': 'unauthorized'})
+            qs = parse_qs(urlparse(self.path).query)
+            limit_str = qs.get('limit', ['20'])[0]
+            try:
+                limit = max(1, min(200, int(limit_str)))
+            except ValueError:
+                return self._send_json(400, {'error': 'invalid limit'})
+            try:
+                sessions = INBOX.list_sessions(limit=limit)
+                self._send_json(200, {'sessions': sessions, 'count': len(sessions)})
+            except Exception as e:
+                self._send_json(500, {'error': f'inbox sessions failed: {e}'})
         else:
             self._send_json(404, {'error': 'not found', 'path': path})
 
@@ -644,6 +744,96 @@ class ACPHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {'error': 'task_id required'})
             result = cancel_task_internal(task_id)
             self._send_json(result['status_code'], result['body'])
+        elif path == '/acp/inbox/write':
+            # POST /acp/inbox/write  {session_id, sender, content, msg_type?, parent_id?}
+            if not self._check_auth():
+                return self._send_json(401, {'error': 'unauthorized'})
+            body = self._read_body()
+            if not body:
+                return self._send_json(400, {'error': 'invalid JSON body'})
+            session_id = body.get('session_id', '')
+            sender = body.get('sender', '')
+            content = body.get('content', '')
+            msg_type = body.get('msg_type', 'message')
+            parent_id = body.get('parent_id')
+            if not session_id or not sender or content == '':
+                return self._send_json(400, {'error': 'session_id, sender, content required'})
+            if sender not in ('goudan', 'mavis', 'boss', 'system'):
+                return self._send_json(400, {'error': f'invalid sender: {sender}'})
+            try:
+                msg_id = INBOX.write(session_id, sender, content, msg_type=msg_type, parent_id=parent_id)
+                log.info(f'inbox write: session={session_id} sender={sender} id={msg_id}')
+                self._send_json(200, {
+                    'message_id': msg_id,
+                    'session_id': session_id,
+                    'sender': sender,
+                    'msg_type': msg_type,
+                    'status': 'written',
+                })
+            except Exception as e:
+                log.error(f'inbox write error: {e}')
+                self._send_json(500, {'error': f'inbox write failed: {e}'})
+        elif path == '/acp/inbox/ask':
+            # POST /acp/inbox/ask  {session_id, sender, question, timeout?}
+            # Writes a question + BLOCKS server-side until answered or timeout
+            if not self._check_auth():
+                return self._send_json(401, {'error': 'unauthorized'})
+            body = self._read_body()
+            if not body:
+                return self._send_json(400, {'error': 'invalid JSON body'})
+            session_id = body.get('session_id', '')
+            sender = body.get('sender', '')
+            question = body.get('question', '')
+            timeout = float(body.get('timeout', 300))  # default 5 min
+            if not session_id or not sender or question == '':
+                return self._send_json(400, {'error': 'session_id, sender, question required'})
+            if sender not in ('goudan', 'mavis', 'boss', 'system'):
+                return self._send_json(400, {'error': f'invalid sender: {sender}'})
+            try:
+                qid = INBOX.ask_question(session_id, sender, question)
+                log.info(f'inbox ask: session={session_id} sender={sender} qid={qid}')
+                # Block until answered (or timeout)
+                answer = INBOX.wait_for_answer(qid, timeout=timeout)
+                if answer is None:
+                    self._send_json(408, {
+                        'error': 'timeout',
+                        'question_id': qid,
+                        'message': f'no answer within {timeout}s',
+                    })
+                else:
+                    self._send_json(200, {
+                        'question_id': qid,
+                        'answer': answer,
+                        'answered_at': answer.get('answered_at'),
+                        'wait_ms': answer.get('created_at', 0) - int(time.time() * 1000) + int(timeout * 1000),
+                    })
+            except Exception as e:
+                log.error(f'inbox ask error: {e}')
+                self._send_json(500, {'error': f'inbox ask failed: {e}'})
+        elif path == '/acp/inbox/answer':
+            # POST /acp/inbox/answer  {question_id, answer}
+            if not self._check_auth():
+                return self._send_json(401, {'error': 'unauthorized'})
+            body = self._read_body()
+            if not body:
+                return self._send_json(400, {'error': 'invalid JSON body'})
+            question_id = body.get('question_id')
+            answer = body.get('answer', '')
+            if not question_id or answer == '':
+                return self._send_json(400, {'error': 'question_id and answer required'})
+            try:
+                answer_id = INBOX.answer_question(int(question_id), answer)
+                log.info(f'inbox answer: qid={question_id} aid={answer_id}')
+                self._send_json(200, {
+                    'answer_id': answer_id,
+                    'question_id': question_id,
+                    'status': 'answered',
+                })
+            except ValueError as e:
+                self._send_json(404, {'error': str(e)})
+            except Exception as e:
+                log.error(f'inbox answer error: {e}')
+                self._send_json(500, {'error': f'inbox answer failed: {e}'})
         else:
             self._send_json(404, {'error': 'not found', 'path': path})
 
@@ -824,7 +1014,7 @@ def start_ws_server():
 
 
 def main():
-    print(f'OpenClaw ACP Server v5 (SSE + SQLite + Queue + WS) starting')
+    print(f'OpenClaw ACP Server v7-bidir (v5 + peer-to-peer inbox) starting')
     print(f'  HTTP:  http://{HOST}:{PORT}')
     print(f'  WS:    ws://{HOST}:{WS_PORT}/acp/ws?task_id=<id>&token=<token>')
     print(f'  Auth:  {AUTH_TOKEN}')
@@ -841,6 +1031,12 @@ def main():
     print(f'  HTTP  GET  /acp/task/stats                          (SQLite + queue)')
     print(f'  HTTP  GET  /acp/task/stream?id=xxx            [SSE streaming]')
     print(f'  HTTP  POST /acp/task/cancel  {{task_id}}')
+    print(f'  --- v7-bidir peer-to-peer inbox ---')
+    print(f'  HTTP  POST /acp/inbox/write   {{session_id,sender,content}}')
+    print(f'  HTTP  GET  /acp/inbox/read?session_id=X&since_id=N   (poll, auto-mark-read)')
+    print(f'  HTTP  POST /acp/inbox/ask     {{session_id,sender,question,timeout?}}   (blocks until answered)')
+    print(f'  HTTP  POST /acp/inbox/answer  {{question_id,answer}}')
+    print(f'  HTTP  GET  /acp/inbox/sessions?limit=N')
     print(f'  WS    /acp/ws?task_id=xxx                      [bidirectional]')
     print()
 

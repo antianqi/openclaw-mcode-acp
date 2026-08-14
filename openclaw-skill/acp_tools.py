@@ -29,6 +29,9 @@ for _p in _CANDIDATES:
         break
 
 from acp_client import ACPClient, ACPError, read_token_from_server
+import urllib.parse
+import time
+import json
 
 
 # ---------- Singleton client ----------
@@ -142,6 +145,132 @@ def stats() -> dict:
         'active': h.get('queue', {}).get('active', 0),
         'max_concurrent': h.get('queue', {}).get('max_concurrent', 3),
     }
+
+
+# ---------- Inbox (v7-bidir: peer-to-peer with mavis) ----------
+
+VALID_SENDERS = frozenset({'goudan', 'mavis', 'boss', 'system'})
+
+
+def inbox_write(session_id: str, content, sender: str = 'goudan',
+                msg_type: str = 'message', parent_id: int = None) -> int:
+    """POST /acp/inbox/write — write a message to a session.
+
+    Args:
+        session_id: grouping key (e.g. 'xls-2026-07')
+        content: str or dict (auto-JSON-encoded)
+        sender: 'goudan' / 'mavis' / 'boss' / 'system'
+        msg_type: 'message' / 'question' / 'answer'
+        parent_id: link to parent message (for question→answer)
+
+    Returns:
+        message_id (int)
+    """
+    if sender not in VALID_SENDERS:
+        raise ValueError(f'invalid sender: {sender}. Must be one of {sorted(VALID_SENDERS)}')
+    r = _client()._request('POST', '/acp/inbox/write', {
+        'session_id': session_id,
+        'sender': sender,
+        'content': content,
+        'msg_type': msg_type,
+        'parent_id': parent_id,
+    })
+    data = json.loads(r.read().decode('utf-8'))
+    return data.get('message_id')
+
+
+def inbox_read(session_id: str, since_id: int = 0, sender: str = None,
+               msg_type: str = None, limit: int = 50) -> list:
+    """GET /acp/inbox/read — read new messages in a session (auto-marked-read).
+
+    Returns:
+        list of message dicts: {id, session_id, sender, msg_type, content, parent_id,
+                                 created_at, read_at, answered_at, created_at_iso}
+    """
+    qs = {'session_id': session_id, 'since_id': str(since_id), 'limit': str(limit)}
+    if sender:
+        qs['sender'] = sender
+    if msg_type:
+        qs['msg_type'] = msg_type
+    qs_str = urllib.parse.urlencode(qs)
+    r = _client()._request('GET', f'/acp/inbox/read?{qs_str}')
+    data = json.loads(r.read().decode('utf-8'))
+    return data.get('messages', [])
+
+
+def inbox_ask(session_id: str, question, sender: str = 'mavis',
+              timeout: float = 300) -> dict:
+    """POST /acp/inbox/ask — write a question, BLOCK until answered or timeout.
+
+    Args:
+        session_id: grouping key
+        question: str or dict
+        sender: who's asking (default 'mavis')
+        timeout: seconds to wait (default 5 min)
+
+    Returns:
+        dict {question_id, answer, answered_at} on success
+        dict {error: 'timeout', question_id} on timeout
+    """
+    if sender not in VALID_SENDERS:
+        raise ValueError(f'invalid sender: {sender}')
+    try:
+        r = _client()._request('POST', '/acp/inbox/ask', {
+            'session_id': session_id,
+            'sender': sender,
+            'question': question,
+            'timeout': timeout,
+        }, timeout=int(timeout + 5))
+        data = json.loads(r.read().decode('utf-8'))
+        # Unwrap the answer envelope — return just the content, not the whole msg dict
+        ans = data.get('answer')
+        if isinstance(ans, dict) and 'content' in ans:
+            data['answer'] = ans['content']
+        return data
+    except ACPError as e:
+        # 408 timeout is a normal business outcome (no answer in time)
+        if e.status == 408 and isinstance(e.body, dict):
+            return e.body
+        raise
+
+
+def inbox_answer(question_id: int, answer) -> int:
+    """POST /acp/inbox/answer — answer a pending question.
+
+    Returns:
+        answer_id (int)
+    """
+    try:
+        r = _client()._request('POST', '/acp/inbox/answer', {
+            'question_id': question_id,
+            'answer': answer,
+        })
+        data = json.loads(r.read().decode('utf-8'))
+        return data.get('answer_id')
+    except ACPError as e:
+        # 404 (question_id not found) — return None instead of raising
+        if e.status == 404:
+            return None
+        raise
+
+
+def inbox_sessions(limit: int = 20) -> list:
+    """GET /acp/inbox/sessions — list recent sessions with activity stats."""
+    r = _client()._request('GET', f'/acp/inbox/sessions?limit={limit}')
+    data = json.loads(r.read().decode('utf-8'))
+    return data.get('sessions', [])
+
+
+# Convenience: peer collaboration helpers
+
+def peer_session_id(prefix: str = 'session') -> str:
+    """Generate a unique session_id like 'session-20260814-084530'."""
+    return time.strftime(f'{prefix}-%Y%m%d-%H%M%S')
+
+
+def peer_greet(session_id: str, message: str) -> int:
+    """Goudan sends an opening message to mavis. Returns message_id."""
+    return inbox_write(session_id, message, sender='goudan')
 
 
 # ---------- Module self-test ----------

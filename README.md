@@ -68,6 +68,15 @@ print(result['answer'])
 | GET | `/acp/task/stream?id=X` | yes | **SSE one-way streaming** |
 | POST | `/acp/task/cancel` | yes | Cancel running/queued task |
 
+**Peer-to-peer inbox (v7-bidir, goudan ↔ mavis):**
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/acp/inbox/write` | yes | Write a message to a session |
+| GET | `/acp/inbox/read?session_id=X&since_id=N&sender=Y&msg_type=Z&limit=N` | yes | Read new messages (auto-mark-read) |
+| POST | `/acp/inbox/ask` | yes | Write a question + **block server-side** until answered (or timeout) |
+| POST | `/acp/inbox/answer` | yes | Answer a pending question |
+| GET | `/acp/inbox/sessions?limit=N` | yes | List recent sessions |
+
 ### WebSocket (port 9998)
 
 ```
