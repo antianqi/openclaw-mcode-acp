@@ -1,1 +1,5 @@
-websockets>=16.0
+# OpenClaw ACP — Python runtime dependencies
+# Pin minor version: websockets 16 introduced the asyncio API we depend on
+# (websockets.asyncio.server). websockets 17+ may break compat; we will bump
+# deliberately after testing. See docs/RUNTIME_DEPS.md for the full contract.
+websockets>=16.0,<17

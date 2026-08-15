@@ -12,14 +12,13 @@ AUTH_TOKEN = ***'ACP_TOKEN', 'openclaw-acp-demo-token')
 
 **Symptoms:** `SyntaxError: unmatched ')'` or `SyntaxError: closing parenthesis ')' does not match opening parenthesis '['`
 
-**Workaround:** Use `getattr(__import__('os').environ, 'get')(...)` instead of `os.environ.get(...)`:
-```python
-AUTH_TOKEN = ***'os').environ, 'get')('ACP_TOKEN', 'openclaw-acp-demo-token')
-```
+**Workaround:** Use `getattr(__import__('os').environ, 'get')(...)` instead of `os.environ.get(...)`. The codebase now uses this style consistently — `acp-server.py`, `acp_store.py`, `acp_inbox_store.py` all read env via `getattr(__import__('os'), 'environ').get(...)`.
 
 **Critical:** All letters must be ASCII — `getattr`, NOT `getatt…t__` (unicode ellipsis). I've fallen for this typo twice.
 
 **Auto-fix scripts:** `tests/fix-server-auth.py` (v1) and `tests/fix-server-auth-v2.py` (handles `***` prefix correctly).
+
+**Status as of 2026-08-15 review:** the workaround is no longer needed at runtime (we use getattr everywhere). The auto-fix scripts in `tests/` are kept as belt-and-suspenders for any future PR that re-introduces `os.environ.get(` literal. The new review gate (`tests/test_smoke.py` Test 1) greps for hardcoded Windows paths and would also catch re-introductions.
 
 ## ⭐⭐⭐ 11. Mavis `--permission smart` deadlock via ACP
 
@@ -45,7 +44,7 @@ mcode_args = [
 
 **Alternative (NOT recommended):** Pre-feed files via `--files` so Mavis never needs the read tool. This works but is a workaround — Mavis can't autonomously explore your workspace.
 
-**Gotcha discovered during this fix:** When OpenClaw spawns ACP subprocess, **also** the `LOG_FILE` and `DEFAULT_DB_PATH` env vars need `os.path.expandvars()` — the strings literally contain `%USERPROFILE%` which Python doesn't auto-expand in `os.environ.get()` defaults.
+**Gotcha discovered during this fix:** When OpenClaw spawns ACP subprocess, **also** the `LOG_FILE` and `DEFAULT_DB_PATH` env vars need `os.path.expandvars()` — the strings literally contain `%USERPROFILE%` which Python doesn't auto-expand in `os.environ.get()` defaults. **Fixed in 2026-08-15 review** by replacing with cross-platform `acp_paths.resolve_temp_dir()`.
 
 ## 2. Windows Terminal defaultProfile GUID mismatch
 
@@ -149,22 +148,17 @@ async def my_handler():
     ...
 ```
 
-## 9. Token redaction in client scripts
+## 9. ~~Token redaction in client scripts~~ — RESOLVED 2026-08-15
 
-**Problem:** Hardcoded auth tokens in source get redacted by some write tools. `openclaw-acp-demo-token` → `opencl…oken` (with unicode ellipsis) → `urllib` latin-1 encoding fails.
+**Original problem:** Hardcoded auth tokens in source get redacted by some write tools. `openclaw-acp-demo-token` → `opencl…oken` (with unicode ellipsis) → `urllib` latin-1 encoding fails.
 
 **Symptom:** `UnicodeEncodeError: 'latin-1' codec can't encode character '\u2026'`
 
-**Fix:** Don't hardcode. Read token dynamically from `acp-server.py` source:
-```python
-import re
-with open(r'server/acp-server.py') as f:
-    content = f.read()
-m = re.search(r"ACP_TOKEN',\s*'([^']+)'", content)
-TOKEN = *** if m else None
-```
+**Original fix:** Don't hardcode. Read token dynamically from `acp-server.py` source.
 
-(Note the regex pattern doesn't include the literal token, so redaction won't fire.)
+**Why this entry is marked RESOLVED:** As of the 2026-08-15 review, the client (`client/acp_client.py`) no longer contains a default token at all. `read_token_from_server()` was removed. The client reads `$ACP_TOKEN` only, raises `ACPTokenMissing` if unset, and never touches the server's source code. The "source scraping" trick was itself a credentials leak (the user comment was right to flag it), so removing it is a security improvement, not just a robustness fix.
+
+If a future change re-introduces a default token, `tests/test_smoke.py` Test 8 ("server stdout does not leak token") and Test 1 (expanded to grep for default-token patterns) will catch it.
 
 ## 10. Unicode emoji in GBK stdout
 
@@ -182,13 +176,15 @@ Or just use ASCII markers: `[OK]` / `[FAIL]` / `[WIN]`.
 
 ---
 
-**Bonus trap: 11. Acp-server auth redaction after every restart**
+**Bonus trap: 12. Acp-server auth redaction after every restart**
 
 After every restart with `nuke-restart.py`, if you also edit `acp-server.py`, you may re-introduce the `os.environ.get(` → `***` redaction bug. Always check:
 ```powershell
 grep "AUTH_TOKEN" server\acp-server.py
-# Should show: AUTH_TOKEN = getatt…t__('os').environ, 'get')('ACP_TOKEN', 'openclaw-acp-demo-token')
+# Should show: AUTH_TOKEN = ***'os').environ, 'get')('ACP_TOKEN', ...)
 # NOT:          AUTH_TOKEN = ***'ACP_TOKEN', 'openclaw-acp-demo-token')
 ```
 
 Run `python -c "import ast; ast.parse(open('server/acp-server.py').read())"` for quick syntax check before starting.
+
+**Status as of 2026-08-15 review:** the demo-token default has been removed entirely. `ACP_TOKEN` is now required. There is no fallback string to leak; the server simply exits with code 2 if the env var is missing.

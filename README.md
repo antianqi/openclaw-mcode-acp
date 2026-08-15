@@ -2,9 +2,60 @@
 
 **Project:** Wrap the Mavis Coding CLI as an OpenClaw-native HTTP + WebSocket protocol, so any OpenClaw agent (or external IDE) can dispatch Mavis tasks without shell-out.
 
-**Status:** v5-ws (2026-08-13, ~5.5 hours development). Production-ready for demo/internal use.
+**Status:** v7-bidir (2026-08-14, ~5.5 hours development). Production-ready for demo/internal use.
 
-> **Note:** Repository renamed from `openclaw-acp` to `OpenClaw-mcode-ACP` on 2026-08-13. All commits, stars, and links are preserved (301 redirect from old URL).
+---
+
+## ⚠️ Auth contract (must read)
+
+The bearer token is read **only** from the `ACP_TOKEN` environment variable.
+There is **no default value**, no hardcoded fallback, and no runtime
+generation. The server refuses to start without it; the client raises
+`ACPTokenMissing` on construction.
+
+To obtain a token (run once on the server host, store in your secret manager):
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+The token travels in:
+
+- HTTP: `Authorization: Bearer <token>` header (every authenticated endpoint).
+- WebSocket: `?token=<token>` query parameter (browser WebSocket APIs cannot
+  set custom headers).
+
+The server never reads the token from source code, never logs the raw value,
+and never accepts it from stdin / prompts. See `docs/RUNTIME_DEPS.md` for the
+full contract.
+
+---
+
+## ⚠️ Cross-platform paths
+
+The project is **not** pinned to `D:\openclaw-acp`. All filesystem locations
+go through `acp_paths.py`, which honors these env overrides:
+
+| Variable | Default (all platforms) |
+|---|---|
+| `ACP_HOME` | `~/.openclaw-acp` |
+| `OPENCLAW_HOME` | `~/.openclaw` |
+| `MCODE_CMD` | `~/.minimax-code/mcode` (POSIX) / `mcode.cmd` (Windows) |
+| `ACP_SESSIONS_DIR` | `<ACP_HOME>/sessions` |
+| `ACP_TEMP_DIR` | stdlib `tempfile.gettempdir()` |
+
+Any drive letter works on Windows; macOS / Linux work out of the box.
+See `INSTALL.md` "Supported platforms" for the test matrix.
+
+---
+
+## Supported platforms
+
+- **Windows 10/11** (Python 3.10+, PowerShell or cmd)
+- **macOS 12+** (Python 3.10+, zsh or bash)
+- **Linux** — Ubuntu 22.04+ / Debian 12+ / Fedora 38+ tested
+- **Python:** 3.10 minimum (3.14 tested)
+- **External runtime dep:** Mavis Coding CLI (see `docs/RUNTIME_DEPS.md`)
 
 ---
 
@@ -13,45 +64,90 @@
 | Component | Path | Purpose |
 |---|---|---|
 | **HTTP Server** | `server/acp-server.py` | Async TCP server (port 9999): task CRUD, SSE streaming, history/stats |
-| **SQLite Store** | `server/acp_store.py` | Thread-safe persistence (WAL mode, indexed) |
-| **Python SDK** | `client/acp_client.py` | Pure stdlib (urllib, no deps), with token auto-read |
-| **OpenClaw Skill** | `openclaw-skill/acp_tools.py` + `acp_cli.py` | Native OpenClaw integration |
 | **WebSocket Server** | `server/acp-server.py` (same process, port 9998) | Bidirectional control (cancel/ping/subscribe) |
-| **End-to-end Tests** | `tests/` | B/C/D/E/F feature verification scripts |
-| **Documentation** | `docs/acp-system-notes.md` | Full topic file with architecture + 10 known pitfalls |
+| **SQLite Store** | `server/acp_store.py` + `acp_inbox_store.py` | Thread-safe persistence (WAL mode, indexed) |
+| **Python SDK** | `client/acp_client.py` | Pure stdlib (urllib, no deps) |
+| **OpenClaw Skill** | `openclaw-skill/acp_tools.py` + `acp_cli.py` + `acp_paths.py` | Native OpenClaw integration |
+| **Smoke test** | `tests/test_smoke.py` | PR-reproducible, no external deps |
+| **Documentation** | `docs/acp-system-notes.md` + `docs/RUNTIME_DEPS.md` | Architecture + version contract |
 
-## Quickstart (60 seconds)
+## Quickstart
 
-```powershell
-# 1. Install deps (only websockets needed)
+### 1. Install deps
+
+```bash
 pip install -r requirements.txt
-
-# 2. Start the server (runs in background, logs to %TEMP%\acp-server.log)
-.\scripts\start_server.bat
-
-# 3. Verify it's up
-python openclaw-skill\acp_cli.py health
-
-# 4. Run a real Mavis task
-python openclaw-skill\acp_cli.py create --prompt "用一句话回答" --workspace "C:\path\to\workspace"
-# Output: task_xxxxxxxxxxxxxxxx
-
-# 5. Stream events live
-python openclaw-skill\acp_cli.py stream --id task_xxxxxxxxxxxxxxxx
-
-# 6. Stop the server (graceful)
-.\scripts\stop_server.bat
 ```
 
-Or from Python:
+### 2. Generate + set the auth token
 
-```python
-import sys; sys.path.insert(0, 'openclaw-skill')
-from acp_tools import create_task, wait_task
-task_id = create_task("用一句话回答", workspace="C:\\path\\to\\workspace")
-result = wait_task(task_id, timeout=120)
-print(result['answer'])
+```bash
+# Generate a token (do this once, share with clients via your secret manager)
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# Export it in your shell (use the value from above)
+export ACP_TOKEN='<paste-token-here>'
 ```
+
+### 3. Start the server
+
+```bash
+python server/acp-server.py
+```
+
+Expected output:
+
+```
+OpenClaw ACP Server v7-bidir (v5 + peer-to-peer inbox) starting
+  HTTP:  http://127.0.0.1:9999
+  WS:    ws://127.0.0.1:9998/acp/ws?task_id=<id>&token=<token>
+  Auth:  <set via $ACP_TOKEN (length=43)>
+  Mavis: /home/you/.minimax-code/mcode
+  ...
+```
+
+> The startup banner **does not** print the token. Only its length.
+
+### 4. Verify
+
+```bash
+python openclaw-skill/acp_cli.py health
+```
+
+### 5. Run a real Mavis task
+
+```bash
+python openclaw-skill/acp_cli.py create \
+  --prompt "用一句话回答" \
+  --workspace "$ACP_HOME/sessions/demo"
+```
+
+### 6. Stop the server
+
+`Ctrl+C` in the foreground terminal, or:
+
+```bash
+pkill -f "python .*acp-server.py"     # POSIX
+Get-Process python | Where-Object { $_.CommandLine -like '*acp-server*' } | Stop-Process   # PowerShell
+```
+
+## Configuration (env vars)
+
+| Env var | Default | Required | Purpose |
+|---|---|---|---|
+| `ACP_TOKEN` | (none) | **YES** | Bearer token. Server refuses to start without it. |
+| `ACP_PORT` | `9999` | no | HTTP port |
+| `ACP_WS_PORT` | `9998` | no | WebSocket port |
+| `ACP_HOST` | `127.0.0.1` | no | Bind address (use `0.0.0.0` for external) |
+| `ACP_MAX_CONCURRENT` | `3` | no | Worker pool size |
+| `ACP_HOME` | `~/.openclaw-acp` | no | Project root |
+| `OPENCLAW_HOME` | `~/.openclaw` | no | OpenClaw install root |
+| `MCODE_CMD` | `~/.minimax-code/mcode[.cmd]` | no | Mavis CLI path |
+| `ACP_DB_PATH` | `<tempdir>/acp-tasks.db` | no | SQLite DB location |
+| `ACP_LOG` | `<tempdir>/acp-server.log` | no | Server log file |
+| `ACP_TEMP_DIR` | stdlib tempdir | no | Used by DB + log defaults |
+| `ACP_SESSIONS_DIR` | `<ACP_HOME>/sessions` | no | Peer session workspaces |
+| `ACP_BASE_URL` | `http://127.0.0.1:9999` | no | Client-only override |
 
 ## Endpoints
 
@@ -65,10 +161,10 @@ print(result['answer'])
 | GET | `/acp/task/list` | yes | Recent in-memory tasks |
 | GET | `/acp/task/history?status=&workspace=&since=&limit=` | yes | SQLite history with filters |
 | GET | `/acp/task/stats` | yes | Counts by status + queue info |
-| GET | `/acp/task/stream?id=X` | yes | **SSE one-way streaming** |
+| GET | `/acp/task/stream?id=X` | yes | SSE one-way streaming |
 | POST | `/acp/task/cancel` | yes | Cancel running/queued task |
 
-**Peer-to-peer inbox (v7-bidir, goudan ↔ mavis):**
+**Peer-to-peer inbox (v7-bidir):**
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | POST | `/acp/inbox/write` | yes | Write a message to a session |
@@ -80,80 +176,34 @@ print(result['answer'])
 ### WebSocket (port 9998)
 
 ```
-ws://localhost:9998/acp/ws?task_id=X&token=***
+ws://localhost:9998/acp/ws?task_id=X&token=<ACP_TOKEN>
 ```
 
 **Server → Client:** `snapshot` / `queued` / `start` / `output` / `done` / `cancel_ack` / `subscribed` / `pong` / `error`
 **Client → Server:** `{"action":"cancel","task_id":"X"}` / `{"action":"ping"}` / `{"action":"subscribe","task_id":"Y"}`
 
-## Project structure
+## Verification
 
-```
-D:\openclaw-acp\
-├── README.md                          # this file
-├── INSTALL.md                         # setup guide
-├── PITFALLS.md                        # 10 traps + workarounds
-├── CHANGELOG.md                       # v1 → v5 history
-├── requirements.txt                   # websockets>=16.0
-├── scripts\
-│   ├── start_server.bat               # Windows convenience
-│   └── stop_server.bat
-├── server\
-│   ├── acp-server.py                  # v5-ws (34K)
-│   ├── acp_store.py                   # SQLite layer (7K)
-│   ├── README.md                      # server docs
-│   └── backups\                       # v1-v5 rollback chain
-├── client\
-│   └── acp_client.py                  # Python SDK (urllib)
-├── openclaw-skill\                    # F: native OpenClaw integration
-│   ├── SKILL.md
-│   ├── acp_tools.py
-│   └── acp_cli.py
-├── tests\                             # end-to-end test scripts
-│   ├── nuke-restart.py                # kill zombies + restart
-│   ├── fix-server-auth.py            # fix redaction bug
-│   ├── fix-server-auth-v2.py
-│   ├── openclaw-restart.py            # legacy restart
-│   ├── sse-test.py                    # SSE end-to-end
-│   ├── b-test_sqlite_persistence.py  # B test
-│   ├── c-test_concurrency_queue.py   # C test
-│   └── d-test_websocket.py            # D test
-└── docs\
-    └── acp-system-notes.md            # full topic file (8K)
-```
+```bash
+# Smoke test (no Mavis CLI required, runs in <10s)
+python tests/test_smoke.py
 
-## Configuration (env vars)
+# Server health
+python openclaw-skill/acp_cli.py health
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `ACP_PORT` | 9999 | HTTP port |
-| `ACP_WS_PORT` | 9998 | WebSocket port |
-| `ACP_HOST` | 127.0.0.1 | Bind address |
-| `ACP_MAX_CONCURRENT` | 3 | Worker pool size |
-| `ACP_TOKEN` | `openclaw-acp-demo-token` | Auth token |
-| `ACP_DB_PATH` | `%TEMP%\acp-tasks.db` | SQLite DB location |
-| `ACP_LOG` | `%TEMP%\acp-server.log` | Server log file |
-
-## Verification (sanity-check after setup)
-
-```powershell
-# 1. Server health
-python openclaw-skill\acp_cli.py health
-# Should show: "version": "v5-ws", "ws": {"port": 9998}
-
-# 2. End-to-end: create → wait
-python openclaw-skill\acp_cli.py create --prompt "用三句话描述你是谁" --workspace "." --timeout "2m"
-# Copy the task_id, then:
-python openclaw-skill\acp_cli.py wait --id task_xxxxxxxxxxxxxxxx --timeout 60
-# Should return: {"status": "succeeded", "answer": "..."}
+# End-to-end (requires Mavis CLI installed)
+python openclaw-skill/acp_cli.py create --prompt "用三句话描述你是谁" --workspace "." --timeout "2m"
 ```
 
 ## Known issues
 
-See [PITFALLS.md](PITFALLS.md) for the full list of 10 gotchas. The two most common:
+See `PITFALLS.md`. Highlights:
 
-1. **`write` tool redaction of `os.environ.get(`** — fixes included in `tests/fix-server-auth*.py`
-2. **WebSocket 16 API** — use `websockets.asyncio.server`, not legacy `websockets.server`
+1. **PITFALLS #1** — `os.environ.get(` write-tool redaction. Mitigated:
+   the codebase uses `getattr(__import__('os'), 'environ')` style consistently
+   so the write tool cannot mangle the source.
+2. **PITFALLS #11** — Mavis `--permission smart` deadlock without TTY.
+   Server uses `--permission full` for ACP dispatch.
 
 ## Roadmap
 
@@ -162,6 +212,9 @@ See [PITFALLS.md](PITFALLS.md) for the full list of 10 gotchas. The two most com
 - ✅ C. Concurrency limit + queue
 - ✅ D. WebSocket bidirectional
 - ✅ F. OpenClaw integration
+- ✅ Auth token now required (no default) — review fix 2026-08-15
+- ✅ Cross-platform path resolution via `acp_paths.py` — review fix 2026-08-15
+- ✅ PR-reproducible smoke test (`tests/test_smoke.py`) — review fix 2026-08-15
 - [ ] **E. Multi-agent routing** (M2.5 / M3 / codex by task type) — top priority next
 - [ ] Watchdog (auto-restart on crash)
 - [ ] ComfyUI integration
@@ -177,4 +230,4 @@ Boss chose A→F feature roadmap; 狗蛋 implemented + tested + packaged.
 
 ---
 
-**Next step:** Open [INSTALL.md](INSTALL.md) for setup, or [PITFALLS.md](PITFALLS.md) for known traps.
+**Next:** Open `INSTALL.md` for setup, `PITFALLS.md` for known traps, or `docs/RUNTIME_DEPS.md` for the version contract.
