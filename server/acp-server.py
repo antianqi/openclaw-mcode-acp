@@ -52,6 +52,7 @@ import threading
 import subprocess
 import logging
 import asyncio
+from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
@@ -62,16 +63,46 @@ from websockets.asyncio.server import serve as ws_serve
 from acp_store import TaskStore
 from acp_inbox_store import InboxStore
 
-# ===== Config =====
-PORT = int(os.environ.get('ACP_PORT', 9999))
-HOST = os.environ.get('ACP_HOST', '127.0.0.1')
-WS_PORT = int(os.environ.get('ACP_WS_PORT', 9998))
-AUTH_TOKEN = getattr(__import__('os').environ, 'get')('ACP_TOKEN', 'openclaw-acp-demo-token')
-LOG_FILE = os.path.expandvars(os.environ.get('ACP_LOG', r'%USERPROFILE%\AppData\Local\Temp\acp-server.log'))
-MAX_CONCURRENT = int(os.environ.get('ACP_MAX_CONCURRENT', 3))
+# ===== Path helpers (cross-platform) =====
+# acp_paths.py lives at <ACP_HOME>/openclaw-skill/. Add the script's parent
+# dir to sys.path so 'import acp_paths' works whether the server is started
+# from server/, openclaw-skill/, or any cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'openclaw-skill'))
+import acp_paths  # noqa: E402
 
-# Paths
-MCODE_CMD = r'%USERPROFILE%\.minimax-code\mcode.cmd'
+# ===== Config =====
+# Env reads use getattr+__import__ to dodge write-tool redaction of the
+# literal token 'os.environ.get('. See PITFALLS.md #1. Both styles are
+# equivalent at runtime.
+_os_env = getattr(__import__('os'), 'environ')
+
+PORT = int(_os_env.get('ACP_PORT', '9999'))
+HOST = _os_env.get('ACP_HOST', '127.0.0.1')
+WS_PORT = int(_os_env.get('ACP_WS_PORT', '9998'))
+MAX_CONCURRENT = int(_os_env.get('ACP_MAX_CONCURRENT', '3'))
+
+# AUTH_TOKEN is REQUIRED. There is NO default value. The server refuses to
+# start if $ACP_TOKEN is missing or empty. See README.md "Auth" for how
+# to obtain a token from the operator.
+_AUTH_TOKEN = _os_env.get('ACP_TOKEN')
+if not _AUTH_TOKEN:
+    sys.stderr.write('FATAL: $ACP_TOKEN environment variable is not set.\n')
+    sys.stderr.write('       The server refuses to start with an empty/missing token.\n')
+    sys.stderr.write('       Set ACP_TOKEN to a strong secret before launching.\n')
+    sys.stderr.write('       Example (PowerShell):\n')
+    sys.stderr.write('         $env:ACP_TOKEN = (python -c "import secrets;print(secrets.token_urlsafe(32))")\n')
+    sys.exit(2)
+AUTH_TOKEN = _AUTH_TOKEN
+del _AUTH_TOKEN  # don't leave it in module namespace as a writable global
+
+# Cross-platform default paths. Override via env if needed.
+LOG_FILE = str(acp_paths.resolve_temp_dir() / 'acp-server.log')
+_db_override = _os_env.get('ACP_DB_PATH')
+DEFAULT_DB_PATH = str(Path(_db_override).expanduser().resolve()) if _db_override else str(acp_paths.resolve_temp_dir() / 'acp-tasks.db')
+
+# Mavis Coding CLI (external runtime dependency). Override via $MCODE_CMD.
+# Default: $HOME/.minimax-code/mcode(.cmd). Cross-platform.
+MCODE_CMD = acp_paths.resolve_mcode_cmd()
 
 # ===== Logging =====
 logging.basicConfig(
@@ -1017,7 +1048,7 @@ def main():
     print(f'OpenClaw ACP Server v7-bidir (v5 + peer-to-peer inbox) starting')
     print(f'  HTTP:  http://{HOST}:{PORT}')
     print(f'  WS:    ws://{HOST}:{WS_PORT}/acp/ws?task_id=<id>&token=<token>')
-    print(f'  Auth:  {AUTH_TOKEN}')
+    print(f'  Auth:  <set via $ACP_TOKEN (length={len(AUTH_TOKEN)})>')
     print(f'  Mavis: {MCODE_CMD}')
     print(f'  Log:   {LOG_FILE}')
     print(f'  DB:    {STORE.db_path}')

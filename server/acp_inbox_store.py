@@ -43,12 +43,19 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-DEFAULT_DB_PATH = os.path.expandvars(os.environ.get(
-    'ACP_DB_PATH',
-    r'%USERPROFILE%\AppData\Local\Temp\acp-tasks.db'
-))
+def _acp_default_db_path() -> str:
+    """Cross-platform default DB path: $ACP_TEMP_DIR or stdlib tempdir."""
+    override = os.environ.get('ACP_TEMP_DIR')
+    if override:
+        return str(Path(override).expanduser().resolve() / 'acp-tasks.db')
+    import tempfile
+    return str(Path(tempfile.gettempdir()).resolve() / 'acp-tasks.db')
+
+
+DEFAULT_DB_PATH = os.environ.get('ACP_DB_PATH') or _acp_default_db_path()
 
 
 class InboxStore:

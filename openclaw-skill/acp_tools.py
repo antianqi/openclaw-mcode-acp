@@ -4,31 +4,43 @@ acp_tools.py — OpenClaw-native Python wrapper for OpenClaw ACP server
 Provides direct Python access to ACP from any OpenClaw session.
 No shell-out, no subprocess overhead. Just import and call.
 
+Auth model
+----------
+The auth bearer token is read from $ACP_TOKEN (no default, no fallback).
+See README.md "Auth" for the contract. This module does NOT scrape or
+generate tokens.
+
+Cross-platform paths
+--------------------
+The underlying SDK (acp_client.py) is resolved via acp_paths:
+  1. <ACP_HOME>/client/                   (packaged project)
+  2. <OPENCLAW_HOME>/skills/mavis-coding/ (OpenClaw install)
+
+$ACP_HOME and $OPENCLAW_HOME override the defaults on any OS.
+
 Usage:
     from acp_tools import create_task, wait_task, stream_task, health
-
-For full docs see SKILL.md in this directory.
 """
 import sys
 import os
 from pathlib import Path
 from typing import Optional, Callable, Iterator, Dict, Any, List
 
-# Make acp_client importable. Try multiple locations:
-#   1. Same project sibling: D:\openclaw-acp\client\
-#   2. Original OpenClaw install: %USERPROFILE%\.openclaw\skills\mavis-coding\
-_HERE = Path(__file__).parent.resolve()
-_CANDIDATES = [
-    str(_HERE.parent / 'client'),                              # packaged project
-    r'%USERPROFILE%\.openclaw\skills\mavis-coding',            # original install
+# Make acp_client importable via cross-platform path resolution.
+# acp_paths is bundled in this directory (openclaw-skill/).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import acp_paths  # noqa: E402
+
+_candidates = [
+    acp_paths.client_sdk_path(),                # packaged project (<ACP_HOME>/client/)
+    acp_paths.mavis_coding_skill_dir() / 'acp_client.py',  # original install location
 ]
-for _p in _CANDIDATES:
-    _expanded = os.path.expandvars(_p)
-    if os.path.isdir(_expanded) and os.path.exists(os.path.join(_expanded, 'acp_client.py')):
-        sys.path.insert(0, _expanded)
+for _p in _candidates:
+    if _p.exists():
+        sys.path.insert(0, str(_p.parent))
         break
 
-from acp_client import ACPClient, ACPError, read_token_from_server
+from acp_client import ACPClient, ACPError, ACPTokenMissing  # noqa: E402
 import urllib.parse
 import time
 import json
@@ -47,7 +59,7 @@ def _client() -> ACPClient:
 
 
 def reset_client():
-    """Reset the singleton client (e.g. if token rotated)."""
+    """Reset the singleton client (e.g. if token rotated via $ACP_TOKEN)."""
     global _default_client
     _default_client = None
 
@@ -122,20 +134,12 @@ def run_and_stream(prompt: str, workspace: str, files: Optional[List[str]] = Non
 
 def history(status: Optional[str] = None, workspace: Optional[str] = None,
             limit: int = 50, since: Optional[int] = None) -> list:
-    """Query SQLite task history with optional filters.
-
-    Args:
-        status: 'succeeded' / 'failed' / 'timeout' / 'cancelled' / 'queued' / 'running'
-        workspace: exact path match
-        limit: 1-500 (default 50)
-        since: unix timestamp ms (e.g. int(time.time()*1000) - 86400000 for last 24h)
-    """
+    """Query SQLite task history with optional filters."""
     return _client()._store.list(status=status, workspace=workspace, limit=limit, since=since)
 
 
 def stats() -> dict:
     """Task counts by status + queue info."""
-    # stats endpoint returns total + by_status + cache_size + queue_size + max_concurrent
     h = _client().health()
     return {
         'total': h.get('db', {}).get('total_tasks', 0),
@@ -154,18 +158,7 @@ VALID_SENDERS = frozenset({'goudan', 'mavis', 'boss', 'system'})
 
 def inbox_write(session_id: str, content, sender: str = 'goudan',
                 msg_type: str = 'message', parent_id: int = None) -> int:
-    """POST /acp/inbox/write — write a message to a session.
-
-    Args:
-        session_id: grouping key (e.g. 'xls-2026-07')
-        content: str or dict (auto-JSON-encoded)
-        sender: 'goudan' / 'mavis' / 'boss' / 'system'
-        msg_type: 'message' / 'question' / 'answer'
-        parent_id: link to parent message (for question→answer)
-
-    Returns:
-        message_id (int)
-    """
+    """POST /acp/inbox/write — write a message to a session."""
     if sender not in VALID_SENDERS:
         raise ValueError(f'invalid sender: {sender}. Must be one of {sorted(VALID_SENDERS)}')
     r = _client()._request('POST', '/acp/inbox/write', {
@@ -181,12 +174,7 @@ def inbox_write(session_id: str, content, sender: str = 'goudan',
 
 def inbox_read(session_id: str, since_id: int = 0, sender: str = None,
                msg_type: str = None, limit: int = 50) -> list:
-    """GET /acp/inbox/read — read new messages in a session (auto-marked-read).
-
-    Returns:
-        list of message dicts: {id, session_id, sender, msg_type, content, parent_id,
-                                 created_at, read_at, answered_at, created_at_iso}
-    """
+    """GET /acp/inbox/read — read new messages in a session (auto-marked-read)."""
     qs = {'session_id': session_id, 'since_id': str(since_id), 'limit': str(limit)}
     if sender:
         qs['sender'] = sender
@@ -202,12 +190,6 @@ def inbox_ask(session_id: str, question, sender: str = 'mavis',
               timeout: float = 300) -> dict:
     """POST /acp/inbox/ask — write a question, BLOCK until answered or timeout.
 
-    Args:
-        session_id: grouping key
-        question: str or dict
-        sender: who's asking (default 'mavis')
-        timeout: seconds to wait (default 5 min)
-
     Returns:
         dict {question_id, answer, answered_at} on success
         dict {error: 'timeout', question_id} on timeout
@@ -222,13 +204,11 @@ def inbox_ask(session_id: str, question, sender: str = 'mavis',
             'timeout': timeout,
         }, timeout=int(timeout + 5))
         data = json.loads(r.read().decode('utf-8'))
-        # Unwrap the answer envelope — return just the content, not the whole msg dict
         ans = data.get('answer')
         if isinstance(ans, dict) and 'content' in ans:
             data['answer'] = ans['content']
         return data
     except ACPError as e:
-        # 408 timeout is a normal business outcome (no answer in time)
         if e.status == 408 and isinstance(e.body, dict):
             return e.body
         raise
@@ -238,7 +218,7 @@ def inbox_answer(question_id: int, answer) -> int:
     """POST /acp/inbox/answer — answer a pending question.
 
     Returns:
-        answer_id (int)
+        answer_id (int) or None if question_id not found (404 swallowed)
     """
     try:
         r = _client()._request('POST', '/acp/inbox/answer', {
@@ -248,7 +228,6 @@ def inbox_answer(question_id: int, answer) -> int:
         data = json.loads(r.read().decode('utf-8'))
         return data.get('answer_id')
     except ACPError as e:
-        # 404 (question_id not found) — return None instead of raising
         if e.status == 404:
             return None
         raise
@@ -260,8 +239,6 @@ def inbox_sessions(limit: int = 20) -> list:
     data = json.loads(r.read().decode('utf-8'))
     return data.get('sessions', [])
 
-
-# Convenience: peer collaboration helpers
 
 def peer_session_id(prefix: str = 'session') -> str:
     """Generate a unique session_id like 'session-20260814-084530'."""
@@ -277,7 +254,11 @@ def peer_greet(session_id: str, message: str) -> int:
 
 if __name__ == '__main__':
     print('=== acp_tools self-test ===')
-    h = health()
+    try:
+        h = health()
+    except ACPTokenMissing as e:
+        print(f'[SKIP] {e}')
+        raise SystemExit(2)
     print(f'Server: {h.get("version")} (port {h.get("port")})')
     print(f'Queue: size={h.get("queue", {}).get("size")} active={h.get("queue", {}).get("active")}')
     print(f'DB: total={h.get("db", {}).get("total_tasks")}')

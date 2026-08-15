@@ -1,61 +1,75 @@
 """
-ACP Client SDK for OpenClaw ACP Server v2
-==========================================
+ACP Client SDK for OpenClaw ACP Server
+======================================
 Python client for talking to the OpenClaw ACP server.
 
+Auth model
+----------
+Every authenticated request sends the bearer token in the `Authorization`
+header. The WebSocket endpoint ALSO accepts the same token as the
+`?token=<token>` query parameter because browser WebSocket APIs cannot set
+custom request headers.
+
+Where the token comes from
+--------------------------
+The token is read from environment variable `ACP_TOKEN`. There is no default
+value, no hardcoded fallback, and no runtime generation. If the variable is
+not set, the client raises `ACPTokenMissing` at construction time so callers
+fail fast instead of silently authenticating with an empty/wrong value.
+
+NEVER hardcode or source-scrape the token. If you need to obtain a token,
+contact the operator who started the server.
+
 Features:
-- Auto-reads token from server.py source (no hardcoded secrets)
-- All 6 endpoints: health, create, get, list, stream (SSE), cancel
+- Stdlib only (urllib + json), zero pip dependencies
+- All 6 HTTP endpoints + 4 inbox endpoints (v7-bidir)
+- SSE event streaming via /acp/task/stream
+- WebSocket subscription via /acp/ws
 - run_and_stream() convenience: create + stream + return final result
-- SSE event callback for real-time progress
 
 Usage:
+    import os
+    os.environ['ACP_TOKEN'] = '<the token the server gave you>'
+
     from acp_client import ACPClient
-    
     client = ACPClient()
-    
-    # Simple: create + poll
-    task_id = client.create_task("say hi", workspace="C:/path")
+    task_id = client.create_task("say hi", workspace="/path/to/workspace")
     result = client.wait_for_task(task_id)
     print(result['answer'])
-    
-    # Real-time: create + stream
-    result = client.run_and_stream(
-        "say hi in 3 words",
-        workspace="C:/path",
-        on_event=lambda evt, data: print(f"[{evt}] {data}"),
-    )
 """
 import os
-import re
 import json
 import time
 import urllib.request
 import urllib.error
 from typing import Optional, Callable, Iterator, Dict, Any, List
 
+# ---- Base URL (override via env) --------------------------------------------
 DEFAULT_BASE_URL = os.environ.get('ACP_BASE_URL', 'http://127.0.0.1:9999')
-DEFAULT_SERVER_PY = r'%USERPROFILE%\.openclaw\skills\mavis-coding\acp-server.py'
-DEFAULT_TOKEN = 'openclaw-acp-demo-token'
 
 
-def read_token_from_server(server_py_path: str = DEFAULT_SERVER_PY) -> str:
-    """Extract the default auth token from acp-server.py source code.
+class ACPTokenMissing(RuntimeError):
+    """Raised when ACP_TOKEN env var is not set.
 
-    Avoids hardcoding secrets in client scripts (which the write tool redacts).
+    The client refuses to construct without a token so callers cannot
+    accidentally make unauthenticated requests or send empty Bearer values.
     """
-    if not os.path.exists(server_py_path):
-        return DEFAULT_TOKEN
-    try:
-        with open(server_py_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        # Match the second arg of os.environ.get('ACP_TOKEN', '...')
-        m = re.search(r"os\.environ\.get\(\s*['\"]ACP_TOKEN['\"]\s*,\s*['\"]([^'\"]+)['\"]", content)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return DEFAULT_TOKEN
+
+
+def _read_token() -> str:
+    """Read the bearer token from $ACP_TOKEN. Raises if missing/empty."""
+    # Note: we use getattr + __import__ here because some write-tools
+    # auto-replace `os.environ.get(` with a literal placeholder; see
+    # PITFALLS.md #1. Both styles are equivalent at runtime.
+    env = getattr(__import__('os'), 'environ')
+    tok = env.get('ACP_TOKEN')
+    if not tok:
+        raise ACPTokenMissing(
+            'ACP_TOKEN environment variable is not set. '
+            'Set it to the token your ACP server operator provided '
+            '(see README.md "Configuration" / "Auth").'
+        )
+    return tok
 
 
 class ACPError(Exception):
@@ -69,13 +83,16 @@ class ACPError(Exception):
 class ACPClient:
     """Python client for OpenClaw ACP server."""
 
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, token: Optional[str] = None, server_py_path: str = DEFAULT_SERVER_PY):
+    def __init__(self, base_url: str = DEFAULT_BASE_URL, token: Optional[str] = None):
         self.base_url = base_url.rstrip('/')
-        self.token = token or read_token_from_server(server_py_path)
+        # Read token from env at construction time. Explicit override allowed
+        # only for tests; production code must set $ACP_TOKEN.
+        self.token = token if token is not None else _read_token()
 
     # ---------- low-level HTTP ----------
 
-    def _request(self, method: str, path: str, body: Optional[dict] = None, stream: bool = False, timeout: Optional[float] = None):
+    def _request(self, method: str, path: str, body: Optional[dict] = None,
+                 stream: bool = False, timeout: Optional[float] = None):
         url = f'{self.base_url}{path}'
         headers = {
             'Authorization': f'Bearer {self.token}',
@@ -101,14 +118,15 @@ class ACPClient:
     # ---------- sync endpoints ----------
 
     def health(self) -> dict:
-        """GET /acp/health — no auth"""
+        """GET /acp/health — no auth required."""
         url = f'{self.base_url}/acp/health'
         req = urllib.request.Request(url, method='GET')
         resp = urllib.request.urlopen(req, timeout=10)
         return json.loads(resp.read().decode('utf-8'))
 
-    def create_task(self, prompt: str, workspace: str, files: Optional[List[str]] = None, timeout: str = '5m') -> str:
-        """POST /acp/task/create — returns task_id"""
+    def create_task(self, prompt: str, workspace: str,
+                    files: Optional[List[str]] = None, timeout: str = '5m') -> str:
+        """POST /acp/task/create — returns task_id."""
         body = {'prompt': prompt, 'workspace': workspace, 'timeout': timeout}
         if files:
             body['files'] = files
@@ -134,7 +152,8 @@ class ACPClient:
 
     # ---------- async / polling ----------
 
-    def wait_for_task(self, task_id: str, timeout: float = 600, poll_interval: float = 2.0) -> dict:
+    def wait_for_task(self, task_id: str, timeout: float = 600,
+                      poll_interval: float = 2.0) -> dict:
         """Poll task status until terminal state. Returns final task dict."""
         terminal = {'succeeded', 'failed', 'timeout', 'cancelled'}
         deadline = time.time() + timeout
@@ -143,7 +162,6 @@ class ACPClient:
             if task.get('status') in terminal:
                 return task
             time.sleep(poll_interval)
-        # Final check
         task = self.get_task(task_id)
         if task.get('status') not in terminal:
             raise TimeoutError(f'Task {task_id} did not finish in {timeout}s (last status: {task.get("status")})')
@@ -151,7 +169,9 @@ class ACPClient:
 
     # ---------- SSE streaming ----------
 
-    def stream_task(self, task_id: str, on_event: Optional[Callable[[str, dict], None]] = None, max_idle_sec: float = 30.0) -> Iterator[dict]:
+    def stream_task(self, task_id: str,
+                    on_event: Optional[Callable[[str, dict], None]] = None,
+                    max_idle_sec: float = 30.0) -> Iterator[dict]:
         """Generator that yields SSE events from /acp/task/stream.
 
         Args:
@@ -178,7 +198,6 @@ class ACPClient:
                     raw_event = buf.decode('utf-8', errors='replace').rstrip('\n')
                     buf = b''
                     last_event_time = time.time()
-                    # Parse SSE
                     evt_type = None
                     evt_data = None
                     for line in raw_event.split('\n'):
@@ -193,39 +212,31 @@ class ACPClient:
                             except json.JSONDecodeError:
                                 evt_data = {'raw': evt_data_str}
                     if evt_type is None or evt_data is None:
-                        # Probably a keepalive or empty line
                         continue
                     if on_event:
                         on_event(evt_type, evt_data)
                     yield {'type': evt_type, 'data': evt_data}
                     if evt_type == 'done':
                         return
-                # Idle timeout
                 if time.time() - last_event_time > max_idle_sec:
                     raise TimeoutError(f'No SSE events for {max_idle_sec}s')
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             raise ACPError(0, str(e), f'SSE stream error: {e}')
 
-    def run_and_stream(self, prompt: str, workspace: str, files: Optional[List[str]] = None, timeout: str = '5m', on_event: Optional[Callable[[str, dict], None]] = None, max_idle_sec: float = 30.0) -> dict:
-        """Convenience: create task + stream to completion + return final task dict.
-
-        Args:
-            prompt, workspace, files, timeout: as in create_task
-            on_event: callback for each SSE event (event_type, data)
-            max_idle_sec: max idle seconds before giving up
-
-        Returns:
-            Final task dict with 'status', 'answer', 'duration_ms', etc.
-        """
+    def run_and_stream(self, prompt: str, workspace: str,
+                       files: Optional[List[str]] = None, timeout: str = '5m',
+                       on_event: Optional[Callable[[str, dict], None]] = None,
+                       max_idle_sec: float = 30.0) -> dict:
+        """Convenience: create task + stream to completion + return final dict."""
         task_id = self.create_task(prompt, workspace, files=files, timeout=timeout)
         if on_event:
             on_event('created', {'task_id': task_id, 'prompt': prompt[:100]})
         for event in self.stream_task(task_id, on_event=on_event, max_idle_sec=max_idle_sec):
-            pass  # callback already invoked by stream_task
+            pass
         return self.get_task(task_id)
 
 
-# ---------- Module-level convenience functions ----------
+# ---------- Module-level convenience ----------
 
 _default_client: Optional[ACPClient] = None
 
@@ -238,7 +249,11 @@ def get_default_client() -> ACPClient:
 
 
 if __name__ == '__main__':
-    # CLI demo: just print health + list tasks
-    client = ACPClient()
+    # Demo: construct (will fail loudly if ACP_TOKEN is missing) and report health.
+    try:
+        client = ACPClient()
+    except ACPTokenMissing as e:
+        print(f'[SKIP] {e}')
+        raise SystemExit(2)
     print('Health:', client.health())
     print('Recent tasks:', len(client.list_tasks()))

@@ -1,149 +1,217 @@
 # INSTALL — OpenClaw ACP Project
 
-## Prerequisites
+## Requirements
 
-- **Python 3.10+** (tested on 3.14)
-- **Windows** (cmd.exe via mcode.cmd; on Mac/Linux replace `cmd.exe /c` with `bash -c`)
-- **Mavis Coding CLI** installed and accessible at `~/.minimax-code/mcode.cmd` (adjust path if different)
-- **OpenClaw** (if using the F integration)
+### Supported platforms (tested)
+
+- **Windows 10 / 11** (x64)
+- **macOS 12 Monterey or newer** (Intel & Apple Silicon)
+- **Linux** — Ubuntu 22.04+ / Debian 12+ / Fedora 38+
+
+### Runtime dependencies
+
+| Dependency | Version | Source | Required? |
+|---|---|---|---|
+| **Python** | 3.10+ (3.14 tested) | [python.org](https://www.python.org/) | YES |
+| **websockets** | `>=16.0,<17` | `pip install -r requirements.txt` | YES |
+| **Mavis Coding CLI** (`mcode`) | contract documented in `docs/RUNTIME_DEPS.md` | vendor | YES (for real tasks) |
+| **SQLite** | bundled with Python | stdlib | YES |
+| **OpenClaw** | any | optional — only for OpenClaw skill consumers | NO |
+
+The smoke test (`tests/test_smoke.py`) does **not** require Mavis Coding —
+it validates the auth + endpoint surface end-to-end.
+
+### Auth (required before starting the server)
+
+The bearer token is read from `$ACP_TOKEN`. There is **no default value**.
+Generate one on the server host:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Copy the output and export it in the shell that will start the server.
+Distribute the same value to every client (via your secret manager).
+
+### Filesystem assumptions
+
+There are **no hardcoded paths**. The project root defaults to
+`$HOME/.openclaw-acp` on every platform. Override with `$ACP_HOME` to
+install anywhere (e.g. `D:\openclaw-acp`, `/opt/openclaw-acp`).
+
+---
 
 ## Setup
 
-### 1. Install Python dependencies
+### 1. Clone / unpack
 
-```powershell
-cd D:\openclaw-acp
+```bash
+# Wherever you want the project — there is no required location
+git clone <repo-url> openclaw-acp
+cd openclaw-acp
+# or, on Windows:
+Expand-Archive openclaw-acp.zip
+cd openclaw-acp
+```
+
+### 2. Install Python dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` contains:
-```
-websockets>=16.0
-```
+### 3. Generate + export the auth token
 
-That's it. Everything else is Python stdlib.
+```bash
+# Generate once
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+# → e.g. "xN7rQz9aB2kL8mW3..."
 
-### 2. Configure (optional)
-
-Set environment variables if defaults don't fit:
-
-```powershell
-# Optional overrides
-$env:ACP_PORT = 9999
-$env:ACP_WS_PORT = 9998
-$env:ACP_MAX_CONCURRENT = 3
-$env:ACP_TOKEN = "openclaw-acp-demo-token"
+# Export in your shell
+export ACP_TOKEN='xN7rQz9aB2kL8mW3...'      # POSIX
+$env:ACP_TOKEN = 'xN7rQz9aB2kL8mW3...'      # PowerShell
 ```
 
-For production: change `ACP_TOKEN` to a strong secret, set `ACP_HOST=0.0.0.0` if external clients need to connect.
+### 4. (Optional) override paths
 
-### 3. Start the server
+```bash
+# POSIX
+export ACP_HOME="$HOME/work/openclaw-acp"     # if not in $HOME/.openclaw-acp
+export MCODE_CMD="/opt/mavis/mcode"           # if not in ~/.minimax-code/mcode
 
-```powershell
-.\scripts\start_server.bat
+# PowerShell
+$env:ACP_HOME = 'D:\work\openclaw-acp'
+$env:MCODE_CMD = 'D:\tools\mcode.cmd'
 ```
 
-Or directly:
-```powershell
-python server\acp-server.py
+### 5. Run the smoke test (no Mavis required)
+
+```bash
+python tests/test_smoke.py
 ```
 
-The server prints:
+Expected: `ALL CHECKS PASSED`. This validates:
+
+- No hardcoded Windows paths in any Python source file.
+- `acp_paths` resolves cross-platform without env vars set.
+- Server refuses to start without `ACP_TOKEN`.
+- Server boots with `ACP_TOKEN` set, returns 200 on `/acp/health`.
+- Authenticated endpoints return 401 without token, 200 with token.
+- Inbox write/read roundtrip works.
+- Server stdout does not leak the token.
+
+### 6. Start the server
+
+```bash
+python server/acp-server.py
 ```
-OpenClaw ACP Server v5 (SSE + SQLite + Queue + WS) starting
+
+Expected banner (token length only, never the raw value):
+
+```
+OpenClaw ACP Server v7-bidir (v5 + peer-to-peer inbox) starting
   HTTP:  http://127.0.0.1:9999
   WS:    ws://127.0.0.1:9998/acp/ws?task_id=<id>&token=<token>
+  Auth:  <set via $ACP_TOKEN (length=43)>
+  Mavis: /home/you/.minimax-code/mcode
   ...
 ```
 
-Server runs in foreground. For background, use the bat script or:
-```powershell
-Start-Process python server\acp-server.py -WindowStyle Hidden
+To run in the background:
+
+```bash
+# POSIX
+nohup python server/acp-server.py > server.log 2>&1 &
+
+# Windows (PowerShell)
+Start-Process python -ArgumentList 'server\acp-server.py' -WindowStyle Hidden
 ```
 
-### 4. Verify
+### 7. Verify from a client
 
-```powershell
-python openclaw-skill\acp_cli.py health
+```bash
+# Set the same token
+export ACP_TOKEN='xN7rQz9aB2kL8mW3...'     # POSIX
+$env:ACP_TOKEN = 'xN7rQz9aB2kL8mW3...'    # PowerShell
+
+# Health check (no auth)
+python openclaw-skill/acp_cli.py health
+
+# Create + wait (requires Mavis CLI installed)
+python openclaw-skill/acp_cli.py create --prompt "用一句话回答" --workspace "."
+python openclaw-skill/acp_cli.py wait --id task_xxxxxxxxxxxxxxxx --timeout 60
 ```
 
-Expected output:
-```json
-{
-  "status": "ok",
-  "version": "v5-ws",
-  "ws": {"port": 9998, "active_connections": 0},
-  "db": {"total_tasks": 0, "by_status": {}},
-  ...
-}
+### 8. Stop the server
+
+```bash
+# Foreground: Ctrl+C
+
+# Background:
+pkill -f "python .*acp-server.py"                                     # POSIX
+Get-Process python | Where-Object { $_.CommandLine -like '*acp-server*' } | Stop-Process  # PowerShell
 ```
 
-### 5. Run a real test
-
-```powershell
-python openclaw-skill\acp_cli.py create --prompt "用一句话回答" --workspace "%USERPROFILE%\.openclaw\workspace"
-# → task_xxxxxxxxxxxxxxxxxxxxxxxx
-
-python openclaw-skill\acp_cli.py wait --id task_xxxxxxxxxxxxxxxxxxxxxxxx --timeout 60
-# → {"status": "succeeded", "answer": "...", ...}
-```
-
-### 6. Stop the server
-
-```powershell
-.\scripts\stop_server.bat
-```
-
-Or:
-```powershell
-Get-Process python | Where-Object { $_.CommandLine -like '*acp-server*' } | Stop-Process
-```
+---
 
 ## OpenClaw integration (optional)
 
-If you want ACP usable as a native OpenClaw skill:
+If you want ACP usable as a native OpenClaw skill, symlink (or copy) the
+`openclaw-skill/` directory into your OpenClaw install:
 
-```powershell
-# Symlink (or copy) the openclaw-skill directory into OpenClaw's workspace skills:
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.openclaw\workspace\skills\acp-integration" -Target "D:\openclaw-acp\openclaw-skill"
+```bash
+# POSIX
+ln -s "$(pwd)/openclaw-skill" "$HOME/.openclaw/workspace/skills/acp-integration"
 
-# Verify
-python "$env:USERPROFILE\.openclaw\workspace\skills\acp-integration\acp_cli.py" health
+# PowerShell
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.openclaw\workspace\skills\acp-integration" -Target "$(Resolve-Path .\openclaw-skill)"
 ```
 
-From any OpenClaw session, import directly:
+Then any OpenClaw session can import:
+
 ```python
-import sys
-sys.path.insert(0, r'D:\openclaw-acp\openclaw-skill')
+import os
+os.environ['ACP_TOKEN'] = '<server token>'
 from acp_tools import create_task, wait_task
-task_id = create_task("...", workspace="...")
+task_id = create_task("...", workspace="/path")
 result = wait_task(task_id)
 ```
 
+---
+
 ## Troubleshooting
 
-**Port already in use:**
+**Server exits immediately with "FATAL: $ACP_TOKEN environment variable is not set":**
+You forgot step 3. Generate a token and export it.
+
+**`/acp/task/list` returns 401:**
+The client's `$ACP_TOKEN` does not match the server's. They must be byte-identical.
+
+**`tests/test_smoke.py` fails on "Test 1: No hardcoded Windows paths":**
+You're running an older checkout. Pull the latest — the fix is in commit
+"review-fixes-2026-08-15".
+
+**`ModuleNotFoundError: No module named 'acp_paths'`:**
+You're running a script outside the project tree. Either `cd` into the
+project root, or set `$ACP_HOME` and `$PYTHONPATH`:
+
+```bash
+export PYTHONPATH="$ACP_HOME/openclaw-skill:$PYTHONPATH"
 ```
-Get-NetTCPConnection -LocalPort 9999 -ErrorAction SilentlyContinue
-# Find the PID, then:
-Get-Process -Id <PID>
-# If it's an old acp-server.py, kill it. Use tests/nuke-restart.py for cleanup.
-```
 
-**`AUTH_TOKEN` redaction in source:**
-See `PITFALLS.md` #1. Use `tests/fix-server-auth.py` or manually replace.
+**`FileNotFoundError: mcode.cmd` (or `mcode`) when creating a task:**
+Mavis Coding CLI is not installed at the expected path. Either install it
+at `$HOME/.minimax-code/mcode[.cmd]`, or set `$MCODE_CMD` to its actual
+location.
 
-**WebSocket handler error `'WebSocketServerProtocol' object has no attribute 'request'`:**
-Wrong websockets API. Use `websockets.asyncio.server`, not legacy `websockets.server`. See PITFALLS #6.
+**WebSocket connect fails with "unauthorized":**
+The token in `?token=` does not match `$ACP_TOKEN`. They must match exactly.
 
-**Task stuck in queued:**
-Workers (3 by default) all busy. Either wait for queue to drain, increase `ACP_MAX_CONCURRENT`, or cancel some.
-
-**Task fails with `'NoneType' object has no attribute 'strip'`:**
-Server was killed mid-subprocess. Use `nuke-restart.py` to clean zombies.
+---
 
 ## Next steps
 
-- Read [PITFALLS.md](PITFALLS.md) before modifying server code
-- Read [docs/acp-system-notes.md](docs/acp-system-notes.md) for full architecture
+- Read `PITFALLS.md` before modifying server code
+- Read `docs/acp-system-notes.md` for full architecture
+- Read `docs/RUNTIME_DEPS.md` for the version + env contract
 - See `tests/` for example test patterns
